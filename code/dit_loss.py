@@ -97,21 +97,24 @@ def build_position_weights(
         if logits is None:
             raise ValueError("entropy_mode=True requires logits in build_position_weights")
         # We need entropy aligned with the CE shift: predict t from t-1.
+        # shifted_logits is (B, S-1, V); entropy is (B, S-1).
         shifted_logits = logits[..., :-1, :].contiguous().float()
-        shifted_response = response_mask[..., 1:].contiguous()
         entropy = shannon_entropy(shifted_logits)
-        # Where the label is masked at the shifted position (i.e. the
-        # corresponding original position is not a response), force weight
-        # to 0 so CE masking still wins.
-        per_position = torch.where(shifted_response, entropy, torch.zeros_like(entropy))
-        # Map the shifted response mask back to the (B, S) layout, then
-        # OVERLAY entropy on those positions. Crucially we do not
-        # overwrite `weights` -- the prompt_weight that was set on
-        # weights[prompt_mask] above must survive into the entropy branch
-        # or exp4_entropy silently degenerates to "no prompt anchor".
-        shifted_response_full = torch.zeros_like(labels, dtype=torch.bool)
-        shifted_response_full[..., 1:] = shifted_response
-        weights = torch.where(shifted_response_full, per_position, weights)
+        # Mask of which TARGET positions are response (so CE is not -100).
+        # shifted_response is (B, S-1): True where position_type[..., 1:] == 2.
+        shifted_response = (position_type[..., 1:] == 2).contiguous()
+        # Per-shifted-position weight: entropy where target is response, else 0.
+        per_position_shifted = torch.where(
+            shifted_response, entropy, torch.zeros_like(entropy)
+        )  # (B, S-1)
+        # Embed the (B, S-1) entropy values back into (B, S) by padding a
+        # 0 at the front. Position 0 has no entropy (nothing predicts from
+        # t-1=-1), and its weight is dropped by weights[..., 1:] in __call__
+        # anyway. Then overlay on response positions only -- prompt_weight
+        # on prompt positions and 0 on pad positions are preserved.
+        entropy_full = torch.zeros_like(weights)
+        entropy_full[..., 1:] = per_position_shifted
+        weights = torch.where(response_mask, entropy_full, weights)
     else:
         if tfidf_tensor is not None:
             ids = labels.clamp(min=0)
