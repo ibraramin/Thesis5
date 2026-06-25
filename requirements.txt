@@ -1,0 +1,40 @@
+# =====================================================================
+# DITTP thesis — environment
+# =====================================================================
+# The vast.ai instance already provides:
+#   - Python 3.10 or 3.11
+#   - PyTorch 2.4.0
+#   - CUDA 12.1 (cudnn9 runtime)
+# Do NOT pip install torch — it will conflict with the preinstalled build.
+# ---------------------------------------------------------------------
+
+# transformers 4.44.0 is the lowest version with reliable torch 2.4.0 support.
+# 4.39.0 (original spec) predates torch 2.4.0 and may emit deprecation warnings
+# or break on newer torch APIs.
+transformers==4.44.0
+peft>=0.11.0
+accelerate>=0.34.0
+datasets>=2.20.0
+
+# flash-attn MUST be installed from a prebuilt wheel — source compilation
+# takes hours to days and is not viable in a 20h compute budget.
+#
+# Pick the wheel that matches your torch + CUDA + Python version from
+# https://github.com/Dao-AILab/flash-attention/releases
+#
+# For torch 2.4.0 + CUDA 12.x + Python 3.10 (most common vast.ai combo):
+#   pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
+#
+# For torch 2.4.0 + CUDA 12.x + Python 3.11, replace cp310 with cp311.
+# For torch 2.4.0 + CUDA 11.x (rare), use the cu11* wheel.
+#
+# If the wheel install fails for any reason, fall back to SDPA by editing
+# code/train.py: change attn_implementation="flash_attention_2" to "sdpa".
+# SDPA is ~1.5-2x slower but works out of the box on any torch 2.x install.
+
+scikit-learn>=1.4.0
+sentencepiece
+protobuf
+einops
+huggingface_hub>=0.23.0
+pyyaml
