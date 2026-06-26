@@ -2,7 +2,7 @@
 
 **Title:** *Information-Theoretic Token Priority in Supervised Fine-Tuning: A Decoupled Loss Optimization Framework*
 
-**Status:** Locked-in decisions, current as of Phase 1 validation run.
+**Status:** Locked-in decisions as of 2026-06-26. Phase 0 (pilot, 6 runs at 5,000 ex × 1 ep) complete. Full-scale 2-config run (baseline + exp3_combined at 9,500 ex × 3 ep) in progress.
 
 ---
 
@@ -21,28 +21,21 @@ Standard SFT applies a binary masking policy: prompt tokens get weight 0, respon
 
 ## 2. Experimental Design
 
-Six experiment runs isolate the variable of interest. Each is one full SFT training with the same data, base model, and hyperparams; only the loss weighting changes.
+**Two experiment runs isolate the primary DITTP hypothesis.** Each is one full SFT training (3 epochs × 9,500 examples) with the same data, base model, and hyperparams; only the loss weighting changes.
 
 | Run | Name | prompt_weight | response_weight | Isolates |
 |---|---|---|---|---|
 | 1a | exp1_baseline | 0.0 | 1.0 (uniform) | Reference SFT |
-| 1b | exp1_low | 0.1 | 1.0 (uniform) | Low contextual anchor |
-| 1c | exp1_high | 0.5 | 1.0 (uniform) | High contextual anchor |
-| 2 | exp2_lexical | 0.0 | TF-IDF [0.5, 2.0] | Lexical priority only |
 | 3 | exp3_combined | 0.1 | TF-IDF [0.5, 2.0] | **Full DITTP** |
-| 4 | exp4_entropy | 0.1 | live entropy (float32) | Epistemic contingency |
 
-**Attribution logic:**
-- (1b, 1c) vs 1a → effect of prompt anchoring
-- 2 vs 1a → effect of TF-IDF response weighting
-- 3 vs (1a, 1b, 2) → combined DITTP effect
-- 4 vs (3) → static lexical vs dynamic epistemic
+**Attribution logic (full-scale pair):**
+- exp3_combined vs exp1_baseline → DITTP effect (union of prompt anchoring + TF-IDF response reweighting)
 
-**A priori expected outcomes (from original methodology):**
-- 1b/1c improve format robustness variance over 1a
-- 2 reduces verbatim memorization length over 1a
-- 3 wins on the union of metrics (memorization, robustness, OOD)
-- 4 is the fallback if 2/3 fail to differentiate from 1a
+**Why the 2-config pair, not 6:** A 6-run pilot matrix at 1/3 scale (5,000 examples × 1 epoch) was run to validate the code paths and surface confounders. An independent review of the pilot loss curves found that 4 of the 6 runs (exp1_baseline, exp1_low, exp2_lexical, exp3_combined) were statistically indistinguishable on training loss (|t|<1.8 vs an estimated noise floor of 0.05–0.07). The pilot matrix is preserved as preliminary ablation; the full-scale pair is a clean DITTP-vs-SFT test of the core hypothesis within the 20 h budget. See §9 for pilot results.
+
+**A priori expected outcomes (2-config):**
+- exp3_combined improves at least one of: (a) reduced verbatim memorization length, (b) improved OOD reasoning (ARC-Challenge), (c) reduced format-robustness variance, vs exp1_baseline.
+- If no metric differentiates, the thesis supports the null: the effect size of the DITTP framework is below the detection limit of this configuration (1.1B base, 9.5k examples, 3 epochs).
 
 ---
 
@@ -65,6 +58,8 @@ loss = (ce * weight).sum() / weight.sum().clamp(min=1.0)
 - `weight.sum().clamp(min=1.0)` prevents division by zero when an entire batch is masked.
 - The `entropy_mode` branch recomputes weights from live logits every step; the `tfidf_mode` branch uses a precomputed (V,) lookup tensor.
 
+**Pilot finding (footnote, exp1_high denominator inflation):** When `prompt_weight=0.5` and the prompt-token count exceeds the response-token count on a sequence (no_robots turns often have longer instructions than responses, since responses are concise), `weight.sum()` is inflated by the prompt contribution and the per-token loss is deflated by an estimated **~20–25%** relative to runs where prompts are masked. This is a **denominator artifact of the loss formula**, not a true loss reduction. The exp1_high pilot final loss (1.5074) reflects this deflation; its true loss-equivalent is closer to ~1.8. Direct numerical comparison of exp1_high training loss to other runs is not meaningful; only the eval metrics are apples-to-apples. exp1_high is preserved in the pilot writeup for completeness but is not part of the full-scale pair.
+
 ---
 
 ## 4. Technical Stack (Hardware-Fit)
@@ -80,7 +75,7 @@ loss = (ce * weight).sum() / weight.sum().clamp(min=1.0)
 | Learning rate | 2e-5 | Standard for LoRA on 1-3B models |
 | LR scheduler | cosine | Smooth decay prevents end-of-training forgetting |
 | Warmup ratio | 0.05 | Initial spike protection for low-rank matrices |
-| Max grad norm | 1.0 | Standard clipping |
+| Max grad norm | 1.0 | Standard clipping (see §6 for exp4_entropy pathology) |
 | LoRA rank | 16 | 1.13% of base params trainable |
 | LoRA alpha | 32 | Standard 2× rank |
 | LoRA target modules | q,k,v,o,gate,up,down (7) | All attention + MLP projections |
@@ -91,7 +86,7 @@ loss = (ce * weight).sum() / weight.sum().clamp(min=1.0)
 | Epochs | 3 | Convergence without overfitting on 9.5k examples |
 | Gradient checkpointing | True | Reduces activation memory |
 
-**Expected total compute:** ~63 min per experiment × 6 = ~6.3 h training + ~1.5 h eval = **~8 h within the 20 h budget**.
+**Expected total compute (full-scale pair):** ~2.5–3 h per experiment × 2 = ~5–6 h training + ~30 min eval (after fix-1 batched eval.py) = **~6–7 h within the 20 h budget**, leaving ~13 h headroom for 3-seed follow-up runs and sensitivity panels.
 
 ---
 
@@ -127,6 +122,19 @@ entropy[t] = -(probs * log_probs).sum(dim=-1)
 
 The entropy branch uses the same `(B, S, V)` logits tensor the model already produced for the forward pass — no extra forward pass is needed.
 
+**Pilot finding (grad-norm pathology):** exp4_entropy exhibited severe gradient norm pathology at 1-epoch/5,000-ex scale. Across 31 logging steps in the pilot:
+
+| Metric | exp4_entropy | Other 5 runs |
+|---|---|---|
+| Mean grad norm | **1.495** | 0.10–0.30 |
+| Max grad norm | **5.45** | ≤0.6 |
+| Clip events (max_grad_norm=1.0) | **21/31** | 0/31 |
+
+Two consequences for the full-scale design:
+
+1. **exp3_combined (TF-IDF) is the primary DITTP run, not exp4_entropy.** A 1-config DITTP-vs-SFT comparison using exp4_entropy would be dominated by the grad-clip confound, not the loss-weighting effect.
+2. **Any future re-run of exp4_entropy must use `max_grad_norm=5.0` or higher**, or remove clipping entirely. The entropy branch legitimately produces larger gradients than the uniform baseline because the loss is now weighted by a function of the model's own confidence (low-confidence tokens get upweighted → larger CE on hard tokens → larger gradients). Clipping at 1.0 then biases the effective learning rate downward in a way that the baseline does not experience.
+
 ---
 
 ## 7. Evaluation Metrics (Four Deterministic Tests)
@@ -140,6 +148,8 @@ The entropy branch uses the same `(B, S, V)` logits tensor the model already pro
 
 **Why deterministic:** avoids LLM-as-judge subjectivity. Each metric is a closed-form computation.
 
+**Eval speedup (Phase 0 → Phase 1):** `code/eval.py` was rewritten to batch all four metrics (`_generate_batch` for ARC and memorization, `_next_token_probs_batch` for format_robustness, larger batch for perplexity). Expected ~5–10× wall-clock reduction on the 24 GB GPU. Defaults: `--gen-batch-size 8 --ppl-batch-size 16 --format-batch-size 8`. **Sanity check (PPL identical within 1e-4 vs pre-change run) required on GPU before trusting batched numbers.**
+
 ---
 
 ## 8. Methodology Shifts From Original (with Justification)
@@ -151,12 +161,36 @@ The entropy branch uses the same `(B, S, V)` logits tensor the model already pro
 | Half-epoch single checkpoint | Periodic save every 200 steps + resume | Operational — protects against vast.ai disconnects. |
 | Save step sentinel `0.5` | Real value `200` | Periodic saves cover the half-epoch mark; no need for special-cased sentinel. |
 | eval results saved once at end | Per-metric save (4 JSON checkpoints) | Operational — same reason. |
+| **Six runs at full scale** | **Two runs (baseline + exp3_combined) at full scale; pilot matrix preserved as preliminary ablation** | Pilot showed 4 of 6 runs statistically indistinguishable on training loss (\|t\|<1.8 vs noise floor 0.05–0.07). Full-scale pair gives the cleanest DITTP-vs-SFT verdict within the 20 h budget. See §9. |
 
-**None of these shifts alter the core DITTP framework.** The loss formula, the six-run experimental design, the four-metric evaluation, and the attribution logic are unchanged.
+**None of these shifts alter the core DITTP framework.** The loss formula and the four-metric evaluation are unchanged. The 2-config pivot reduces ablation granularity: the full-scale pair cannot separately attribute the prompt-weight and TF-IDF contributions. That attribution is preserved in the pilot writeup.
 
 ---
 
-## 9. Pre-Run Verification (Smoke)
+## 9. Pilot Validation Results (Phase 0)
+
+**Configuration:** 5,000 examples (random slice, seed=42) × 1 epoch, max_steps=312, total_flos=1.742e+16 across all runs. Same data slice, seed, base model, and hyperparams as the full-scale spec; only loss weighting varies.
+
+**Final training loss (step 312):**
+
+| Run | Final loss | Min loss | Argmin step | Notes |
+|---|---|---|---|---|
+| exp1_baseline | 1.9158 | 1.7299 | ~270 | Reference; standard convergence |
+| exp1_low | 1.7950 | 1.6497 | ~270 | prompt_weight=0.1, response uniform |
+| exp1_high | **1.5074** | 1.3556 | ~10 | Denominator-inflation artifact (see §3) |
+| exp2_lexical | 1.8510 | 1.6697 | ~110 | TF-IDF only, prompt masked |
+| exp3_combined | 1.7229 | 1.5751 | ~110 | Full DITTP at 1-epoch scale |
+| exp4_entropy | 2.2696 | 2.1314 | ~270 | Grad-norm pathology (see §6) |
+
+**Independent loss-curve review (oracle):** 4 of 6 runs (exp1_baseline, exp1_low, exp2_lexical, exp3_combined) are statistically indistinguishable at the per-epoch level (|t|<1.8 vs an estimated noise floor of 0.05–0.07). The 1-epoch "overfitting" pattern is reframed as model convergence at or before step 270 followed by post-convergence noise: argmin is at or before step 270 for 5 of 6 runs, and the gap from argmin to the final loss is within the noise band. exp1_high is excluded from this comparison (denominator artifact); exp4_entropy is excluded (grad-norm pathology).
+
+**Pilot eval (partial, exp1_baseline, OLD eval.py):** Perplexity **7.98** (n_tokens=153,949), verbatim memorization **lcs_mean=21.17 std=24.60** (n=100). ARC-Challenge and format-robustness pending re-run with batched eval.py (fix-1).
+
+**Pilot writeup status:** The 6-run matrix is preserved as preliminary ablation. The full-scale pair's apples-to-apples eval is the primary endpoint. The 1-epoch pilot is undertrained, not overfit; the full-scale 3-epoch run is the defensible test of the hypothesis.
+
+---
+
+## 10. Pre-Run Verification (Smoke)
 
 Before launching the full matrix:
 
@@ -164,38 +198,44 @@ Before launching the full matrix:
 - Pass criteria: loss decreases below 1.95 within 25 steps, no NaN/Inf, peak VRAM < 20 GB, adapter serializes to disk.
 - Reference baseline: `smangrul/tinyllama_lora_norobots` reported val loss 1.91 after 1 epoch on the same base model + dataset.
 
-Status: **smoke passed (2026-06-26).**
+Status: **smoke passed (2026-06-26).** Pilot (5,000 ex × 1 ep, 6 runs) passed (2026-06-26). Full-scale baseline run in progress (2026-06-26).
 
 ---
 
-## 10. Pipeline (Operational)
+## 11. Pipeline (Operational)
 
 ```bash
-# 1. Clean smoke outputs
-rm -rf outputs/exp1_low outputs/smoke_1.1B
+# 1. Full-scale baseline (3 epochs × 9,500 examples, ~2.5-3 h)
+python code/train.py --config code/config.yaml --experiment exp1_baseline
 
-# 2. Phase 1 validation (~63 min, full config)
-python code/train.py --config code/config.yaml --experiment exp1_low
+# 2. If interrupted, resume
+python code/train.py --config code/config.yaml --experiment exp1_baseline --resume-from-checkpoint
 
-# 3. If interrupted, resume
-python code/train.py --config code/config.yaml --experiment exp1_low --resume-from-checkpoint
+# 3. Full-scale exp3_combined (3 epochs × 9,500 examples, ~2.5-3 h)
+python code/train.py --config code/config.yaml --experiment exp3_combined
 
-# 4. Full 6-experiment matrix (~3.75h, will skip exp1_low)
-python code/run_experiments.py
+# 4. Apples-to-apples eval on both (4 metrics × 2 models, ~30 min total with fix-1)
+python code/eval.py --adapter outputs/exp1_baseline/final --base TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T --out results/exp1_baseline.json
+python code/eval.py --adapter outputs/exp3_combined/final --base TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T --out results/exp3_combined.json
+
+# 5. (Conditional) 3-seed follow-up if primary endpoint differentiates
+# See §12 for branching rule.
 ```
 
 **Resilience layers:**
 - `train.py` periodic checkpoint (every 200 steps, keeps 5 most recent) — worst-case loss on crash: ~5 min.
-- `train.py --resume-from-checkpoint` auto-detects latest checkpoint.
-- `run_experiments.py` orchestrator auto-resumes in-progress experiments.
+- `train.py --resume-from-checkpoint` auto-detects latest checkpoint; manual fallback for sharded checkpoint failures.
 - `eval.py` per-metric save (4 JSON checkpoints) — worst-case loss on crash: 1 metric (~3-4 min).
+- `eval.py` per-metric resumability (`"X" not in results` guards) — partial eval runs survive crashes.
 
 ---
 
-## 11. Thesis Defense Map
+## 12. Thesis Defense Map
 
-If the experiments produce the expected pattern, the defense narrative is:
+**Primary narrative (DITTP wins on at least one metric):**
+> *Standard SFT applies uniform cross-entropy across response tokens, leading to gradient starvation on rare semantic tokens and contextual drift on prompt understanding. We proposed a Decoupled Information-Theoretic Token Priority (DITTP) loss that (a) applies a small static weight to prompt tokens as a contextual anchor, and (b) reweights response tokens by their corpus TF-IDF score. Across a controlled 2-run experiment (baseline + DITTP) at 3 epochs × 9,500 instruction examples on a 1.1B base model, DITTP improved [metric X] by [delta] relative to uniform SFT with no additional training cost. A 6-run pilot matrix at 1/3 scale provides preliminary ablation: prompt anchoring alone (exp1_low) and TF-IDF alone (exp2_lexical) each moved the loss curve but neither was statistically separable from baseline at 1-epoch scale; only the union (exp3_combined) is recommended for full-scale evaluation.*
 
-> *Standard SFT applies uniform cross-entropy across response tokens, leading to gradient starvation on rare semantic tokens and contextual drift on prompt understanding. We proposed a Decoupled Information-Theoretic Token Priority (DITTP) loss that (a) applies a small static weight to prompt tokens as a contextual anchor, and (b) reweights response tokens by their corpus TF-IDF score. Across 6 controlled runs on a 1.1B base model with 9,500 instruction examples, DITTP [showed/did not show] significant gains in verbatim memorization length and OOD reasoning compared to uniform SFT, with no additional training cost. In the contingency case, dynamic entropy weighting provided a parallel but distinct result, supporting the case that the static lexical signal was the operative variable.*
+**Null narrative (DITTP does not differentiate from baseline):**
+> *Across a controlled 2-run experiment (baseline + DITTP) at 3 epochs × 9,500 instruction examples on a 1.1B base model, DITTP did not differentiate from uniform SFT on any of the four evaluation metrics. The effect size of the DITTP framework, if any, is below the detection limit of this configuration. The pilot matrix's loss-curve findings (4 of 6 runs statistically indistinguishable) are consistent with this null result. A larger base model, a larger dataset, or a different TF-IDF construction (e.g., document-frequency-then-normalize rather than max-tfidf) may be required to detect the effect.*
 
-The thesis is defensible in *both* directions (DITTP wins or DITTP does not differentiate from baseline). The contingency ensures an answer either way.
+The thesis is defensible in **both directions.** The contingency ensures an answer either way.

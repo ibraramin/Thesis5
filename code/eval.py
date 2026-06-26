@@ -72,6 +72,45 @@ def _generate(
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
 
+def _generate_batch(
+    model,
+    tokenizer,
+    prompts: list[str],
+    max_new_tokens: int,
+    do_sample: bool = False,
+) -> list[str]:
+    """Batched generation with left-padding. Returns decoded continuations, one per prompt.
+
+    With tokenizer.padding_side = "left", all prompts in the batch are padded to the
+    longest prompt, so input_ids has shape (batch, max_prompt_len). generate() with
+    attention_mask produces output of shape (batch, max_prompt_len + new_len). We
+    slice out[:, input_len:] to recover only the newly generated tokens.
+
+    With do_sample=False (greedy), per-example results are identical to single-example
+    _generate() calls in the same order (up to bf16 reduction order on different
+    hardware; on the same hardware with the same input shape the argmax is stable).
+    """
+    chat_prompts = [_build_chat_prompt(tokenizer, p) for p in prompts]
+    enc = tokenizer(
+        chat_prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=1024,
+    ).to(model.device)
+    with torch.no_grad():
+        out = model.generate(
+            input_ids=enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+    input_len = enc["input_ids"].shape[1]
+    new_tokens = out[:, input_len:]
+    return [tokenizer.decode(t, skip_special_tokens=True) for t in new_tokens]
+
+
 # ---------------------------------------------------------------------------
 # 1. Perplexity
 # ---------------------------------------------------------------------------
@@ -80,7 +119,7 @@ def eval_perplexity(
     model,
     tokenizer,
     test_data: list[dict],
-    batch_size: int = 4,
+    batch_size: int = 16,
     max_length: int = 1024,
 ) -> dict[str, float]:
     """Standard sliding-window-free perplexity over the no_robots test split.
@@ -152,19 +191,28 @@ def eval_verbatim_memorization(
     n: int = 100,
     max_new_tokens: int = 128,
     seed: int = 42,
+    batch_size: int = 4,
 ) -> dict[str, float]:
     """Sample n training prompts, generate, and measure longest common
     substring with the gold response. We report mean and std across n.
+
+    The inner loop batches generation calls (left-padded). batch_size=4
+    is the conservative default for max_new_tokens=128; the CLI default
+    is 8 (overrideable via --gen-batch-size) and the user can drop it
+    back to 4 if the 3B model OOMs at batch=8 * 128 new tokens.
     """
     model.eval()
     rng = random.Random(seed)
     sample = rng.sample(train_data, k=min(n, len(train_data)))
 
     lengths: list[int] = []
-    for ex in sample:
-        gen = _generate(model, tokenizer, ex["prompt"], max_new_tokens=max_new_tokens)
-        lcs = _longest_common_substring(gen, ex["response"])
-        lengths.append(lcs)
+    for start in range(0, len(sample), batch_size):
+        batch_ex = sample[start:start + batch_size]
+        prompts = [ex["prompt"] for ex in batch_ex]
+        gens = _generate_batch(model, tokenizer, prompts, max_new_tokens=max_new_tokens)
+        for ex, gen in zip(batch_ex, gens):
+            lcs = _longest_common_substring(gen, ex["response"])
+            lengths.append(lcs)
 
     if not lengths:
         return {"lcs_mean": 0.0, "lcs_std": 0.0, "n": 0}
@@ -202,11 +250,18 @@ def eval_arc_challenge(
     n: int = 1172,
     max_new_tokens: int = 64,
     cache_dir: str | None = None,
+    batch_size: int = 8,
 ) -> dict[str, float]:
     """Exact-match accuracy on allenai/ai2_arc (ARC-Challenge test split).
 
     The model sees the question + the four options, generates a short
     continuation, and we extract the first A/B/C/D letter.
+
+    The outer loop batches examples in groups of `batch_size` and
+    generates them together via _generate_batch (left-padded). The
+    per-example letter extraction and counter logic is preserved
+    exactly, so the only difference vs. the per-example loop is one
+    shared forward pass per batch.
     """
     model.eval()
     ds = load_dataset("allenai/ai2_arc", "ARC-Challenge", cache_dir=cache_dir)
@@ -214,20 +269,26 @@ def eval_arc_challenge(
     n = min(n, len(test))
     correct = 0
     answered = 0
-    for i in range(n):
-        ex = test[i]
-        question = ex["question"]
-        labels = ex["choices"]["label"]
-        texts = ex["choices"]["text"]
-        options = "\n".join(f"{lbl}. {txt}" for lbl, txt in zip(labels, texts))
-        prompt = f"{question}\n\nOptions:\n{options}\n\nAnswer with a single letter (A, B, C, or D)."
-        gen = _generate(model, tokenizer, prompt, max_new_tokens=max_new_tokens)
-        pred = _extract_letter(gen)
-        gold = ex["answerKey"].strip().upper()
-        if pred is not None:
-            answered += 1
-            if pred == gold:
-                correct += 1
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        batch_exs = [test[i] for i in range(start, end)]
+        prompts: list[str] = []
+        golds: list[str] = []
+        for ex in batch_exs:
+            question = ex["question"]
+            labels = ex["choices"]["label"]
+            texts = ex["choices"]["text"]
+            options = "\n".join(f"{lbl}. {txt}" for lbl, txt in zip(labels, texts))
+            prompt = f"{question}\n\nOptions:\n{options}\n\nAnswer with a single letter (A, B, C, or D)."
+            prompts.append(prompt)
+            golds.append(ex["answerKey"].strip().upper())
+        gens = _generate_batch(model, tokenizer, prompts, max_new_tokens=max_new_tokens)
+        for gen, gold in zip(gens, golds):
+            pred = _extract_letter(gen)
+            if pred is not None:
+                answered += 1
+                if pred == gold:
+                    correct += 1
     return {
         "arc_accuracy": correct / max(n, 1),
         "arc_answered": answered / max(n, 1),
@@ -311,6 +372,32 @@ def _next_token_probs(model, tokenizer, prompt: str) -> torch.Tensor:
     return torch.softmax(last_logits, dim=-1)
 
 
+def _next_token_probs_batch(
+    model,
+    tokenizer,
+    prompts: list[str],
+    max_length: int = 1024,
+) -> torch.Tensor:
+    """Batched forward pass returning softmax distributions at the final position.
+
+    Returns shape (batch, vocab_size). Uses left-padding so the final
+    column aligns across all rows in the batch -- each row's last
+    position is the last token of that row's actual prompt.
+    """
+    chat_prompts = [_build_chat_prompt(tokenizer, p) for p in prompts]
+    enc = tokenizer(
+        chat_prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    ).to(model.device)
+    with torch.no_grad():
+        out = model(**enc)
+    last_logits = out.logits[:, -1, :].float()
+    return torch.softmax(last_logits, dim=-1)
+
+
 def eval_format_robustness(
     model,
     tokenizer,
@@ -319,12 +406,19 @@ def eval_format_robustness(
     max_new_tokens: int = 64,
     seed: int = 42,
     cache_dir: str | None = None,
+    batch_size_questions: int = 8,
 ) -> dict[str, float]:
     """Mean variance of next-token probabilities across prompt perturbations.
 
     We pull n short questions from no_robots (or fall back to ARC if no_robots
     isn't available), perturb each one five times, then measure the average
     total-variation distance of the next-token probability vectors.
+
+    The inner loop batches `batch_size_questions` questions at a time. For
+    each batch we build `batch_size_questions * n_perturbations` perturbed
+    prompts, run a single forward pass, and compute the per-question
+    variance across the perturbation axis. Variance is order-invariant, so
+    the aggregated mean is identical to the per-question loop.
     """
     model.eval()
     rng = random.Random(seed)
@@ -346,12 +440,19 @@ def eval_format_robustness(
 
     perturbations = _PERTURBATIONS[:n_perturbations]
     variances: list[float] = []
-    for q in questions:
-        dists = [_next_token_probs(model, tokenizer, _perturb(q, p, rng)) for p in perturbations]
-        # Variance across perturbations at each vocab position, then mean.
-        stacked = torch.stack(dists, dim=0)
-        per_token_var = stacked.var(dim=0, unbiased=False)
-        variances.append(float(per_token_var.mean().item()))
+    for start in range(0, len(questions), batch_size_questions):
+        batch_q = questions[start:start + batch_size_questions]
+        all_prompts = [_perturb(q, p, rng) for q in batch_q for p in perturbations]
+        all_probs = _next_token_probs_batch(model, tokenizer, all_prompts)
+        # (B*5, V) -> (B, 5, V)
+        B = len(batch_q)
+        P = len(perturbations)
+        V = all_probs.shape[-1]
+        reshaped = all_probs.view(B, P, V)
+        # Variance across the 5 perturbations for each (q, v) pair.
+        per_token_var = reshaped.var(dim=1, unbiased=False)
+        # Mean over vocab dim per question.
+        variances.extend(per_token_var.mean(dim=-1).tolist())
 
     if not variances:
         return {"format_variance_mean": 0.0, "format_variance_std": 0.0, "n": 0}
@@ -396,6 +497,9 @@ def main() -> None:
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache-dir", default=None)
+    parser.add_argument("--gen-batch-size", type=int, default=8, help="Batch size for ARC/memorization generation")
+    parser.add_argument("--ppl-batch-size", type=int, default=16, help="Batch size for perplexity")
+    parser.add_argument("--format-batch-size", type=int, default=8, help="Number of questions batched at once in format_robustness (each contributes 5 perturbations)")
     args = parser.parse_args()
 
     transformers_set_seed = __import__("transformers").set_seed
@@ -437,6 +541,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # Critical: required for batched generation
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
@@ -453,7 +558,9 @@ def main() -> None:
 
     if "perplexity" not in results:
         print("[eval] Perplexity")
-        results["perplexity"] = eval_perplexity(model, tokenizer, test_data)
+        results["perplexity"] = eval_perplexity(
+            model, tokenizer, test_data, batch_size=args.ppl_batch_size
+        )
         _save_results()
     else:
         print("[eval] Perplexity: cached, skipping")
@@ -461,7 +568,13 @@ def main() -> None:
     if "memorization" not in results:
         print("[eval] Verbatim memorization")
         results["memorization"] = eval_verbatim_memorization(
-            model, tokenizer, train_data, n=args.n_mem, max_new_tokens=args.max_new, seed=args.seed
+            model,
+            tokenizer,
+            train_data,
+            n=args.n_mem,
+            max_new_tokens=args.max_new,
+            seed=args.seed,
+            batch_size=args.gen_batch_size,
         )
         _save_results()
     else:
@@ -470,7 +583,12 @@ def main() -> None:
     if "arc" not in results:
         print("[eval] ARC-Challenge")
         results["arc"] = eval_arc_challenge(
-            model, tokenizer, n=args.n_arc, max_new_tokens=64, cache_dir=args.cache_dir
+            model,
+            tokenizer,
+            n=args.n_arc,
+            max_new_tokens=64,
+            cache_dir=args.cache_dir,
+            batch_size=args.gen_batch_size,
         )
         _save_results()
     else:
@@ -486,6 +604,7 @@ def main() -> None:
             max_new_tokens=64,
             seed=args.seed,
             cache_dir=args.cache_dir,
+            batch_size_questions=args.format_batch_size,
         )
         _save_results()
     else:
