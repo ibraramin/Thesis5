@@ -248,7 +248,8 @@ def eval_arc_challenge(
     model,
     tokenizer,
     n: int = 1172,
-    max_new_tokens: int = 64,
+    # ARC answers are single letters; 4 covers the letter + trailing EOS
+    max_new_tokens: int = 4,
     cache_dir: str | None = None,
     batch_size: int = 8,
 ) -> dict[str, float]:
@@ -494,7 +495,8 @@ def main() -> None:
     parser.add_argument("--n-mem", type=int, default=100)
     parser.add_argument("--n-perturb", type=int, default=100)
     parser.add_argument("--n-arc", type=int, default=1172)
-    parser.add_argument("--max-new", type=int, default=128)
+    parser.add_argument("--max-new", type=int, default=128, help="Max new tokens for memorization generation")
+    parser.add_argument("--max-new-arc", type=int, default=4, help="Max new tokens for ARC generation (answers are single letters)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--gen-batch-size", type=int, default=8, help="Batch size for ARC/memorization generation")
@@ -586,7 +588,7 @@ def main() -> None:
             model,
             tokenizer,
             n=args.n_arc,
-            max_new_tokens=64,
+            max_new_tokens=args.max_new_arc,
             cache_dir=args.cache_dir,
             batch_size=args.gen_batch_size,
         )
