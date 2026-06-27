@@ -1,7 +1,7 @@
 """
 eval.py
 =======
-Seven deterministic evaluation metrics for DITTP-trained adapters.
+Eight deterministic evaluation metrics for DITTP-trained adapters.
 
 The functions all take a (model, tokenizer) pair. The caller is responsible
 for merging the LoRA adapter into the base model beforehand; the eval
@@ -17,6 +17,7 @@ Metrics:
   5. _wiki_ppl_eval             -- cross-domain PPL on wikitext-103 raw v1 test
   6. _hellaswag_eval            -- 4-way multiple choice accuracy on HellaSwag val
   7. _diversity_eval            -- distinct-1/2 + repetition-4 over the LCS outputs
+  8. _lambada_ppl_eval          -- out-of-distribution PPL on LAMBADA OpenAI test
 """
 
 from __future__ import annotations
@@ -541,6 +542,68 @@ def _wiki_ppl_eval(
 
 
 # ---------------------------------------------------------------------------
+# 8. LAMBADA OpenAI PPL (out-of-distribution language modeling)
+# ---------------------------------------------------------------------------
+
+def _lambada_ppl_eval(
+    model,
+    tokenizer,
+    n: int = 0,
+    batch_size: int | None = None,
+    max_length: int = 0,
+) -> dict[str, Any]:
+    """Out-of-distribution PPL on LAMBADA OpenAI test split.
+
+    Args:
+        model:     The (PEFT-wrapped) model.
+        tokenizer: HF AutoTokenizer.
+        n:         If > 0, only score the first n documents (for smoke tests).
+                   0 means use the full test split (5153 examples).
+        batch_size: PPL batch size. None falls back to 16 (matches _wiki_ppl_eval).
+        max_length: Tokenizer max_length. 0 falls back to tokenizer.model_max_length.
+
+    Returns:
+        dict with keys: perplexity (float | None), n_tokens (int),
+        n_filtered_docs (int), and optionally error (str) on load failure.
+    """
+    model.eval()
+    effective_batch = batch_size if batch_size is not None else 16
+    effective_max_len = max_length if max_length > 0 else tokenizer.model_max_length
+
+    try:
+        ds = load_dataset("EleutherAI/lambada_openai", "en", split="test")
+    except Exception as e:
+        # Sentinel: perplexity=None + error=... so the user sees the failure
+        # in the JSON without the whole eval crashing.
+        return {
+            "perplexity": None,
+            "n_tokens": 0,
+            "n_filtered_docs": 0,
+            "error": f"failed to load LAMBADA: {e}",
+        }
+
+    texts = [ex["text"] for ex in ds]
+    if n > 0:
+        texts = texts[:n]
+    if not texts:
+        return {"perplexity": float("nan"), "n_tokens": 0, "n_filtered_docs": 0}
+
+    print(f"[eval] lambada_ppl: {len(texts)} LAMBADA docs")
+    ppl, n_tokens = _compute_ppl_from_texts(
+        model,
+        tokenizer,
+        texts,
+        batch_size=effective_batch,
+        max_length=effective_max_len,
+    )
+    return {
+        "perplexity": ppl,
+        "n_tokens": n_tokens,
+        "n_filtered_docs": len(texts),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 6. HellaSwag 4-way multiple choice
 # ---------------------------------------------------------------------------
 
@@ -723,7 +786,7 @@ def _diversity_eval(generations: list[str]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Run all four metrics against a merged (base + adapter) model.
+    """Run all eight metrics against a merged (base + adapter) model.
 
     Usage:
         python eval.py --adapter outputs/exp1_baseline \
@@ -738,7 +801,7 @@ def main() -> None:
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from code.dit_data import load_no_robots
+    from dit_data import load_no_robots
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--adapter", required=True, help="Path to LoRA adapter dir")
@@ -757,12 +820,14 @@ def main() -> None:
     parser.add_argument("--gen-batch-size", type=int, default=8, help="Batch size for ARC/memorization generation")
     parser.add_argument("--ppl-batch-size", type=int, default=16, help="Batch size for perplexity")
     parser.add_argument("--format-batch-size", type=int, default=8, help="Number of questions batched at once in format_robustness (each contributes 5 perturbations)")
-    # New metric knobs (metrics 5-7)
+    # New metric knobs (metrics 5-8)
     parser.add_argument("--wiki-ppl-n", type=int, default=0,
                         help="Limit wikitext PPL to first N examples. 0 = use all of test split.")
     parser.add_argument("--hellaswag-n", type=int, default=1000,
                         help="Limit HellaSwag eval to first N examples. 0 = use all 10042.")
-    # Skip flags for each of the 7 metrics. The original 4 (ppl, lcs,
+    parser.add_argument("--lambada-ppl-n", type=int, default=0,
+                        help="Limit LAMBADA PPL to first N examples. 0 = use all 5153 of test split.")
+    # Skip flags for each of the 8 metrics. The original 4 (ppl, lcs,
     # arc, format) were not present before but are added so smoke tests
     # can skip the slow existing metrics while exercising the new ones.
     parser.add_argument("--skip-ppl", action="store_true", help="Skip no_robots perplexity")
@@ -772,6 +837,7 @@ def main() -> None:
     parser.add_argument("--skip-wiki-ppl", action="store_true", help="Skip wikitext-103 PPL")
     parser.add_argument("--skip-hellaswag", action="store_true", help="Skip HellaSwag")
     parser.add_argument("--skip-diversity", action="store_true", help="Skip distinct-n + repetition-4 (does NOT skip the LCS generations; only the post-processing)")
+    parser.add_argument("--skip-lambada-ppl", action="store_true", help="Skip LAMBADA PPL (out-of-distribution language modeling eval)")
     args = parser.parse_args()
 
     transformers_set_seed = __import__("transformers").set_seed
@@ -903,7 +969,7 @@ def main() -> None:
     else:
         print("[eval] Format robustness: cached, skipping")
 
-    # ---- new metrics 5-7 (not gated by the resumability cache; these
+    # ---- new metrics 5-8 (not gated by the resumability cache; these
     # are cheap and idempotent, so re-running them is fine and skipping
     # them via a flag is the user's escape hatch) ----------------------
 
@@ -923,6 +989,31 @@ def main() -> None:
             _save_results()
     else:
         print("[eval] Wikitext-103 PPL: cached, skipping")
+
+    if "lambada_ppl" not in results:
+        if args.skip_lambada_ppl:
+            print("[eval] LAMBADA PPL: skipped (--skip-lambada-ppl)")
+        else:
+            print("[eval] LAMBADA PPL")
+            results["lambada_ppl"] = _lambada_ppl_eval(
+                model,
+                tokenizer,
+                n=args.lambada_ppl_n,
+                batch_size=args.ppl_batch_size,
+                max_length=1024,
+            )
+            # Print the PPL inline so the user sees it without opening JSON.
+            lambada_ppl = results["lambada_ppl"]
+            if isinstance(lambada_ppl, dict) and lambada_ppl.get("perplexity") is not None:
+                print(
+                    f"[eval] LAMBADA PPL: {lambada_ppl['perplexity']:.4f} "
+                    f"(n_tokens={lambada_ppl['n_tokens']})"
+                )
+            else:
+                print(f"[eval] LAMBADA PPL: FAILED ({lambada_ppl})")
+            _save_results()
+    else:
+        print("[eval] LAMBADA PPL: cached, skipping")
 
     if "hellaswag" not in results:
         if args.skip_hellaswag:
