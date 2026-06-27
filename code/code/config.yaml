@@ -1,0 +1,184 @@
+model: TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T
+max_length: 1024
+seed: 42
+tfidf_cache_dir: ./cache
+# 0 = use the full 9500-example no_robots train split.
+# Set to a positive integer (e.g. 2000) for a small-scale pilot run that
+# trades statistical power for wall-clock cost. CLI flag --max-train-samples
+# overrides this value.
+max_train_samples: 0
+
+# Cheap direction-finding profile. CLI flag --profile micro applies these
+# overrides (max_train_samples, num_train_epochs) on top of whatever the
+# experiment specifies. Used by the m_* micro experiments to keep the
+# 2k-example single-epoch runs reproducible from a single config edit.
+micro:
+  max_train_samples: 2000
+  num_train_epochs: 1
+
+lora:
+  r: 16
+  alpha: 32
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  task_type: CAUSAL_LM
+  dropout: 0.05
+
+training:
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-5
+  num_train_epochs: 3
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  bf16: true
+  gradient_checkpointing: false
+  logging_steps: 10
+  # Periodic checkpointing for resume. ~1782 steps per experiment at
+  # save_steps=200 gives ~9 checkpoints, save_total_limit keeps the 5
+  # most recent on disk. Worst-case loss on crash: ~200 steps (~5 min).
+  save_steps: 200
+  save_strategy: steps
+  save_total_limit: 5
+  report_to: none
+  dataloader_num_workers: 2
+  optim: adamw_torch_fused
+  max_grad_norm: 1.0
+
+experiments:
+  # ------------------------------------------------------------------
+  # Original experiment matrix (results already in results/*.json).
+  # New keys (tfidf_direction, loss_mode, im_mode) default to the
+  # values that reproduce the original loss exactly. Do NOT change.
+  # ------------------------------------------------------------------
+  - name: exp1_baseline
+    prompt_weight: 0.0
+    tfidf_mode: false
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: false
+  - name: exp1_low
+    prompt_weight: 0.1
+    tfidf_mode: false
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: false
+  - name: exp1_high
+    prompt_weight: 0.5
+    tfidf_mode: false
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: false
+  - name: exp2_lexical
+    prompt_weight: 0.0
+    tfidf_mode: true
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: false
+  - name: exp3_combined
+    prompt_weight: 0.1
+    tfidf_mode: true
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: false
+  - name: exp4_entropy
+    prompt_weight: 0.1
+    tfidf_mode: false
+    entropy_mode: true
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: false
+
+  # ------------------------------------------------------------------
+  # Micro experiments (m_* prefix) -- cheap direction-finding runs at
+  # 2k examples, 1 epoch. Run with --profile micro.
+  # ------------------------------------------------------------------
+  # M-baseline: micro re-run of exp1_baseline to anchor the comparison
+  - name: m_baseline
+    prompt_weight: 0.0
+    tfidf_mode: false
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: false
+  # M-rev: reverse TF-IDF direction (weight common tokens more)
+  - name: m_rev
+    prompt_weight: 0.1
+    tfidf_mode: true
+    entropy_mode: false
+    tfidf_direction: reverse
+    loss_mode: weighted_mean
+    im_mode: false
+  # M-noZ: fixed_count loss mode (no LR-deflating /sum(weights))
+  - name: m_noz
+    prompt_weight: 0.1
+    tfidf_mode: true
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: fixed_count
+    im_mode: false
+  # M-noP: no prompt anchor
+  - name: m_nop
+    prompt_weight: 0.0
+    tfidf_mode: true
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: false
+  # M-combined: rev + noZ + noP
+  - name: m_combined
+    prompt_weight: 0.0
+    tfidf_mode: true
+    entropy_mode: false
+    tfidf_direction: reverse
+    loss_mode: fixed_count
+    im_mode: false
+  # M-im: micro instruction modelling (cheap version for sanity check)
+  - name: m_im
+    prompt_weight: 1.0
+    tfidf_mode: false
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: true
+
+  # ------------------------------------------------------------------
+  # Full-scale experiments (f_* prefix) -- the candidates to promote
+  # from the micro sweep. Run with --profile full (default).
+  # ------------------------------------------------------------------
+  # F-rev: full-scale reverse TF-IDF (will be the F-winner placeholder)
+  - name: f_rev
+    prompt_weight: 0.1
+    tfidf_mode: true
+    entropy_mode: false
+    tfidf_direction: reverse
+    loss_mode: weighted_mean
+    im_mode: false
+  # F-noZ: full-scale fixed_count
+  - name: f_noz
+    prompt_weight: 0.1
+    tfidf_mode: true
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: fixed_count
+    im_mode: false
+  # F-combined: full-scale rev + noZ + noP
+  - name: f_combined
+    prompt_weight: 0.0
+    tfidf_mode: true
+    entropy_mode: false
+    tfidf_direction: reverse
+    loss_mode: fixed_count
+    im_mode: false
+  # F-im: instruction modelling (no prompt mask, prompt_weight=1.0)
+  - name: f_im
+    prompt_weight: 1.0
+    tfidf_mode: false
+    entropy_mode: false
+    tfidf_direction: standard
+    loss_mode: weighted_mean
+    im_mode: true
