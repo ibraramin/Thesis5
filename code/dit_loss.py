@@ -142,10 +142,19 @@ class DITTPComputeLoss:
         prompt_weight: float,
         tfidf_tensor: torch.Tensor | None,
         entropy_mode: bool,
+        loss_mode: str = "weighted_mean",
+        im_mode: bool = False,
     ) -> None:
         self.prompt_weight = float(prompt_weight)
         self.tfidf_tensor = tfidf_tensor
         self.entropy_mode = bool(entropy_mode)
+        if loss_mode not in ("weighted_mean", "fixed_count"):
+            raise ValueError(
+                f"Unknown loss_mode {loss_mode!r}; "
+                "expected 'weighted_mean' or 'fixed_count'"
+            )
+        self.loss_mode = loss_mode
+        self.im_mode = bool(im_mode)
 
     def __call__(
         self,
@@ -156,10 +165,18 @@ class DITTPComputeLoss:
         logits = model_outputs.logits
         per_token_ce = per_token_cross_entropy(logits, labels)
 
+        # In Instruction Modelling mode, prompt positions are unmasked in
+        # the labels and should contribute to the loss with weight 1.0
+        # regardless of the configured prompt_weight. The collator is
+        # responsible for not masking the prompt labels; we enforce the
+        # weight override here so a caller cannot accidentally train IM
+        # with prompt_weight=0.1 and have the prompt tokens zeroed out.
+        effective_prompt_weight = 1.0 if self.im_mode else float(self.prompt_weight)
+
         weights = build_position_weights(
             labels=labels,
             position_type=position_type,
-            prompt_weight=self.prompt_weight,
+            prompt_weight=effective_prompt_weight,
             tfidf_tensor=self.tfidf_tensor,
             entropy_mode=self.entropy_mode,
             logits=logits if self.entropy_mode else None,
@@ -169,7 +186,17 @@ class DITTPComputeLoss:
         weights_shifted = weights[..., 1:].contiguous()
         ce_shifted = per_token_ce
 
-        denom = weights_shifted.sum().clamp(min=1.0)
+        if self.loss_mode == "fixed_count":
+            # Normalize by the unweighted count of response positions
+            # actually contributing to the loss. This preserves the LR
+            # scale of the unweighted baseline: when mean(weights) > 1
+            # (the typical TF-IDF case), the weighted-mean denominator
+            # grows with the average weight, silently deflating the
+            # effective LR. fixed_count removes that confound.
+            num_response = (position_type[..., 1:] == 2).sum().clamp(min=1.0)
+            denom = num_response.float()
+        else:
+            denom = weights_shifted.sum().clamp(min=1.0)
         return (ce_shifted * weights_shifted).sum() / denom
 
 
@@ -187,13 +214,31 @@ class DITTPTrainer(Trainer):
         prompt_weight: float,
         tfidf_tensor: torch.Tensor | None,
         entropy_mode: bool,
+        loss_mode: str = "weighted_mean",
+        im_mode: bool = False,
         **kwargs,
     ) -> None:
+        # transformers 4.46+ renamed the Trainer kwarg `tokenizer` to
+        # `processing_class`; transformers 5.0+ removed `tokenizer` entirely.
+        # Forward under whichever name the installed version accepts so
+        # this works on the pinned 4.44.0 as well as any 5.x local env.
+        if "tokenizer" in kwargs and "processing_class" not in kwargs:
+            try:
+                import inspect
+                import transformers as _hf_trainer_module
+                if "processing_class" in inspect.signature(
+                    _hf_trainer_module.Trainer.__init__
+                ).parameters:
+                    kwargs["processing_class"] = kwargs.pop("tokenizer")
+            except Exception:
+                pass
         super().__init__(*args, **kwargs)
         self._dit_loss = DITTPComputeLoss(
             prompt_weight=prompt_weight,
             tfidf_tensor=tfidf_tensor,
             entropy_mode=entropy_mode,
+            loss_mode=loss_mode,
+            im_mode=im_mode,
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):

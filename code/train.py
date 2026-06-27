@@ -196,7 +196,10 @@ def main() -> None:
         cfg["max_train_samples"] = micro_n
         cfg["training"]["num_train_epochs"] = micro_epochs
         exp["profile"] = "micro"
-        print(f"[train] PROFILE=micro: {micro_n} examples, " f"{micro_epochs} epoch")
+        print(
+            f"[train] PROFILE=micro: {micro_n} examples, "
+            f"{micro_epochs} epoch"
+        )
 
     model_name: str = cfg["model"]
     output_dir = os.path.join("outputs", exp["name"])

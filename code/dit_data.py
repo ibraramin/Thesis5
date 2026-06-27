@@ -109,6 +109,7 @@ def fit_word_tfidf(
     tokenizer,
     min_df: int = 2,
     max_df: float = 0.95,
+    direction: str = "standard",
 ) -> dict[str, float]:
     """Fit a TF-IDF vectorizer over the response column.
 
@@ -116,6 +117,13 @@ def fit_word_tfidf(
     bounds are mandatory: 0.5 keeps frequent tokens from being zeroed out
     entirely, and 2.0 caps the gradient magnitude on rare tokens so a
     handful of long-tail words cannot dominate the loss.
+
+    direction="standard" maps the LOWEST tfidf score to 0.5 and the
+    HIGHEST to 2.0 (rare tokens weighted more -- the original DITTP
+    hypothesis). direction="reverse" inverts that mapping within the
+    same [0.5, 2.0] envelope so common tokens get weight 2.0 and rare
+    tokens get weight 0.5. The clip range is preserved exactly: this
+    is a within-envelope inversion, not a scale change.
     """
     corpus = [ex["response"] for ex in train_split if ex.get("response")]
     vectorizer = TfidfVectorizer(
@@ -138,6 +146,16 @@ def fit_word_tfidf(
     else:
         span = s_max - s_min
         normalized = [0.5 + 1.5 * (float(s) - s_min) / span for s in scores]
+
+    # Reverse the mapping: lowest score -> 2.0, highest -> 0.5. This is a
+    # symmetric flip around 1.25 (the center of [0.5, 2.0]), so each
+    # weight w becomes 2.5 - w.
+    if direction == "reverse":
+        normalized = [2.5 - w for w in normalized]
+    elif direction != "standard":
+        raise ValueError(
+            f"Unknown tfidf direction {direction!r}; expected 'standard' or 'reverse'"
+        )
 
     return {term: float(w) for term, w in zip(terms, normalized)}
 
@@ -191,10 +209,17 @@ def project_word_tfidf_to_subwords(
 # TF-IDF: cached tensor
 # ---------------------------------------------------------------------------
 
-def _cache_path(model_name: str, cache_dir: str = "./cache") -> str:
+def _cache_path(
+    model_name: str,
+    cache_dir: str = "./cache",
+    direction: str = "standard",
+) -> str:
     safe = model_name.replace("/", "_").replace("\\", "_")
     os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, f"tfidf_{safe}.pt")
+    # Direction must be in the cache key: a "reverse" run would otherwise
+    # load the standard-direction cache and silently use the wrong weights.
+    suffix = "" if direction == "standard" else f"_{direction}"
+    return os.path.join(cache_dir, f"tfidf_{safe}{suffix}.pt")
 
 
 def build_tfidf_tensor(
@@ -203,19 +228,22 @@ def build_tfidf_tensor(
     model_name: str,
     cache_dir: str = "./cache",
     force: bool = False,
+    direction: str = "standard",
 ) -> torch.Tensor:
     """Fit word TF-IDF, project to sub-words, and return a (V,) float tensor.
 
-    The result is cached as a .pt file keyed on the model name so the
-    expensive sklearn fit only happens once per tokenizer.
+    The result is cached as a .pt file keyed on (model_name, direction)
+    so the expensive sklearn fit only happens once per (tokenizer, direction)
+    pair. Standard-direction runs keep the legacy filename so existing
+    caches built before the direction key was added still load correctly.
     """
-    path = _cache_path(model_name, cache_dir=cache_dir)
+    path = _cache_path(model_name, cache_dir=cache_dir, direction=direction)
     if os.path.exists(path) and not force:
         tensor = torch.load(path, map_location="cpu")
         if tensor.shape[0] == tokenizer.vocab_size:
             return tensor.float()
 
-    word_tfidf = fit_word_tfidf(train_split, tokenizer)
+    word_tfidf = fit_word_tfidf(train_split, tokenizer, direction=direction)
     subword_tfidf = project_word_tfidf_to_subwords(word_tfidf, tokenizer)
     vocab_size = tokenizer.vocab_size
     tensor = torch.ones(vocab_size, dtype=torch.float32)
@@ -240,10 +268,13 @@ class DITCollator:
          between the instruction and the response.
       3. Mark the prompt span as position_type=1, the response span as
          position_type=2, and any padding as position_type=0.
-      4. Set labels=-100 over both the prompt and the padding; keep real
-         ids only over the response (this is the standard SFT pattern).
-      5. Set per-token weights: prompt_weight for prompt, TF-IDF lookup
-         (or 1.0) for response, 0 for padding.
+      4. Set labels=-100 over padding always. In standard SFT (im_mode=False)
+         also mask the prompt tokens; in Instruction Modelling mode
+         (im_mode=True) the prompt tokens carry their real ids so the
+         loss is computed over them.
+      5. Set per-token weights: prompt_weight for prompt (or 1.0 in IM mode,
+         which the Trainer subclass enforces), TF-IDF lookup (or 1.0) for
+         response, 0 for padding.
     """
 
     def __init__(
@@ -252,11 +283,18 @@ class DITCollator:
         max_length: int = 1024,
         prompt_weight: float = 0.0,
         tfidf_tensor: torch.Tensor | None = None,
+        im_mode: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
         self.prompt_weight = float(prompt_weight)
         self.tfidf_tensor = tfidf_tensor
+        # Instruction Modelling (Shi et al. NeurIPS 2024): include the
+        # prompt tokens in the loss with their real ids, instead of the
+        # standard SFT pattern of masking them with -100. The Trainer
+        # subclass is responsible for forcing the prompt weight to 1.0
+        # when this flag is set; here we just stop masking the labels.
+        self.im_mode = bool(im_mode)
 
     def _encode_prompt(self, prompt: str) -> list[int]:
         """Tokenize just the prompt with the chat template's generation prefix.
@@ -337,11 +375,13 @@ class DITCollator:
             attn = [1] * actual_len + [0] * (max_len - actual_len)
             ids = ids + [pad_id] * (max_len - actual_len)
 
-            # labels: -100 over prompt AND padding. The model never sees
-            # loss for the pad token, which would otherwise try to teach it
-            # to predict pad at the previous real position.
+            # labels: -100 over padding always. The prompt span is masked
+            # in standard SFT (mask=-100 for i < p_len) but revealed in
+            # Instruction Modelling mode (Shi et al. NeurIPS 2024), where
+            # the loss is computed over the prompt tokens as well.
             labels = [-100] * max_len
-            for i in range(p_len, actual_len):
+            prompt_start = 0 if self.im_mode else p_len
+            for i in range(prompt_start, actual_len):
                 labels[i] = ids[i]
 
             # position_type: 1=prompt, 2=response, 0=padding/masked.
