@@ -548,7 +548,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         device_map="auto",
     )
     print(f"[eval] Attaching adapter from {args.adapter}")
