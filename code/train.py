@@ -25,6 +25,7 @@ import json
 import math
 import os
 import sys
+import time
 from typing import Any
 
 import torch
@@ -156,6 +157,17 @@ def main() -> None:
             "pilot runs without editing the YAML."
         ),
     )
+    parser.add_argument(
+        "--profile",
+        choices=["full", "micro"],
+        default="full",
+        help=(
+            "Training profile. 'micro' caps the train split at "
+            "cfg.micro.max_train_samples and num_train_epochs to "
+            "cfg.micro.num_train_epochs for cheap direction-finding runs. "
+            "'full' uses the experiment's normal training budget."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = load_yaml(args.config)
@@ -172,6 +184,19 @@ def main() -> None:
     if args.smoke:
         print("[train] SMOKE mode active")
         apply_smoke_overrides(cfg, exp)
+
+    # Micro profile: cap the train split and force 1 epoch. Comes from the
+    # top-level `micro:` block in config.yaml. Applied AFTER smoke so a
+    # `--smoke --profile micro` invocation keeps the 50-sample smoke
+    # budget and just adds an explicit epoch=1 (already the smoke default).
+    if args.profile == "micro":
+        micro_cfg = cfg.get("micro", {}) or {}
+        micro_n = int(micro_cfg.get("max_train_samples", 2000))
+        micro_epochs = int(micro_cfg.get("num_train_epochs", 1))
+        cfg["max_train_samples"] = micro_n
+        cfg["training"]["num_train_epochs"] = micro_epochs
+        exp["profile"] = "micro"
+        print(f"[train] PROFILE=micro: {micro_n} examples, " f"{micro_epochs} epoch")
 
     model_name: str = cfg["model"]
     output_dir = os.path.join("outputs", exp["name"])
@@ -220,6 +245,7 @@ def main() -> None:
             train_split=train_data,
             model_name=model_name,
             cache_dir=cfg.get("tfidf_cache_dir", "./cache"),
+            direction=str(exp.get("tfidf_direction", "standard")),
         )
         print(f"[train] TF-IDF tensor shape: {tuple(tfidf_tensor.shape)}")
 
@@ -228,6 +254,7 @@ def main() -> None:
         max_length=int(cfg.get("max_length", 1024)),
         prompt_weight=float(exp["prompt_weight"]),
         tfidf_tensor=tfidf_tensor,
+        im_mode=bool(exp.get("im_mode", False)),
     )
 
     train_ds = Dataset.from_list(train_data)
@@ -239,7 +266,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         device_map="auto",
     )
     model.config.use_cache = False  # required when using grad checkpointing
@@ -324,6 +351,8 @@ def main() -> None:
         prompt_weight=float(exp["prompt_weight"]),
         tfidf_tensor=tfidf_tensor,
         entropy_mode=bool(exp["entropy_mode"]),
+        loss_mode=str(exp.get("loss_mode", "weighted_mean")),
+        im_mode=bool(exp.get("im_mode", False)),
     )
 
     # Re-add the half-epoch callback in non-smoke mode.
@@ -363,6 +392,10 @@ def main() -> None:
     print("[train] Starting training ...")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+    # Wall-clock timing spans both resume and fresh paths below; the two
+    # `trainer.train(...)` invocations are the only thing that can
+    # dominate the runtime of this script.
+    t0 = time.time()
     if resume_ckpt:
         # LoRA resume workaround. HF Trainer's _load_from_checkpoint
         # calls load_sharded_checkpoint, which requires
@@ -411,6 +444,13 @@ def main() -> None:
     if torch.cuda.is_available():
         peak_gb = torch.cuda.max_memory_allocated() / 1e9
         print(f"[train] Peak VRAM: {peak_gb:.2f} GB")
+    elapsed = time.time() - t0
+    total_steps = int(getattr(trainer.state, "global_step", 0))
+    sec_per_step = elapsed / max(1, total_steps)
+    print(
+        f"[train] Wall-clock: {elapsed:.1f}s "
+        f"({sec_per_step:.3f} s/step over {total_steps} steps)"
+    )
 
     # ------------------------------------------------------------------
     # Save final adapter
@@ -426,8 +466,12 @@ def main() -> None:
         "model": model_name,
         "prompt_weight": float(exp["prompt_weight"]),
         "tfidf_mode": bool(exp["tfidf_mode"]),
+        "tfidf_direction": str(exp.get("tfidf_direction", "standard")),
         "entropy_mode": bool(exp["entropy_mode"]),
+        "loss_mode": str(exp.get("loss_mode", "weighted_mean")),
+        "im_mode": bool(exp.get("im_mode", False)),
         "smoke": bool(exp.get("smoke", False)),
+        "profile": str(exp.get("profile", "full")),
         "steps_per_epoch": steps_per_epoch,
         "n_train": len(train_data),
         "seed": seed,

@@ -73,12 +73,29 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true", help="Forward --smoke to train.py")
     parser.add_argument("--skip-eval", action="store_true", help="Train only, no eval")
     parser.add_argument("--train-timeout", type=int, default=None, help="Seconds per train run")
+    parser.add_argument(
+        "--profile",
+        choices=["all", "full", "micro"],
+        default="all",
+        help=(
+            "Restrict the experiment list by name prefix. 'micro' runs only "
+            "experiments whose name starts with 'm_'; 'full' runs only "
+            "those starting with 'f_'; 'all' runs everything in the YAML "
+            "order. The chosen profile is also forwarded to train.py."
+        ),
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
     experiments: list[dict[str, Any]] = cfg.get("experiments", [])
+    if args.profile == "micro":
+        experiments = [e for e in experiments if e["name"].startswith("m_")]
+        print(f"[orch] --profile micro: filtered to {len(experiments)} m_* experiment(s)")
+    elif args.profile == "full":
+        experiments = [e for e in experiments if e["name"].startswith("f_")]
+        print(f"[orch] --profile full: filtered to {len(experiments)} f_* experiment(s)")
     if args.only:
         wanted = set(args.only)
         experiments = [e for e in experiments if e["name"] in wanted]
@@ -116,6 +133,8 @@ def main() -> None:
             ]
             if args.smoke:
                 train_cmd.append("--smoke")
+            if args.profile in ("full", "micro"):
+                train_cmd.extend(["--profile", args.profile])
             # Auto-resume from latest periodic checkpoint if one exists.
             # HF Trainer writes checkpoint-XXX/ dirs on every save_steps.
             ckpt_candidates = sorted(glob.glob(os.path.join(out_dir, "checkpoint-*")))
