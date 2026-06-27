@@ -43,8 +43,8 @@ from transformers import (
 # Make sibling-module imports work regardless of the cwd.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from dit_data import DITCollator, build_tfidf_tensor, load_no_robots  # noqa: E402
-from dit_loss import DITTPTrainer  # noqa: E402
+from code.dit_data import DITCollator, build_tfidf_tensor, load_no_robots  # noqa: E402
+from code.dit_loss import DITTPTrainer  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # YAML / experiment resolution

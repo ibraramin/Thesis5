@@ -1,7 +1,7 @@
 """
 eval.py
 =======
-Four deterministic evaluation metrics for DITTP-trained adapters.
+Seven deterministic evaluation metrics for DITTP-trained adapters.
 
 The functions all take a (model, tokenizer) pair. The caller is responsible
 for merging the LoRA adapter into the base model beforehand; the eval
@@ -9,16 +9,22 @@ functions themselves do not touch PEFT. This keeps the eval math focused
 on the metrics rather than on adapter plumbing.
 
 Metrics:
-  1. eval_perplexity           -- standard PPL over the no_robots test split
+  1. eval_perplexity            -- standard PPL over the no_robots test split
   2. eval_verbatim_memorization -- longest common substring vs. training refs
+                                   (also feeds the diversity metric)
   3. eval_arc_challenge         -- exact-match A/B/C/D on ai2_arc
   4. eval_format_robustness     -- variance of next-token probs across perturbations
+  5. _wiki_ppl_eval             -- cross-domain PPL on wikitext-103 raw v1 test
+  6. _hellaswag_eval            -- 4-way multiple choice accuracy on HellaSwag val
+  7. _diversity_eval            -- distinct-1/2 + repetition-4 over the LCS outputs
 """
 
 from __future__ import annotations
 
+import collections
 import difflib
 import json
+import math
 import random
 import re
 import string
@@ -115,33 +121,31 @@ def _generate_batch(
 # 1. Perplexity
 # ---------------------------------------------------------------------------
 
-def eval_perplexity(
+def _compute_ppl_from_texts(
     model,
     tokenizer,
-    test_data: list[dict],
-    batch_size: int = 16,
+    texts: list[str],
+    batch_size: int,
     max_length: int = 1024,
-) -> dict[str, float]:
-    """Standard sliding-window-free perplexity over the no_robots test split.
+) -> tuple[float, int]:
+    """Core batched perplexity computation over a list of raw texts.
 
-    Each example is the full prompt+response conversation tokenized once.
-    We use the model's built-in loss with label = input_ids, which is the
-    conventional causal-LM PPL formulation.
+    Shared by the no_robots and wikitext perplexity metrics. Tokenizes the
+    texts in batches (with dynamic padding and right-side truncation), runs
+    a forward pass per batch, and accumulates the per-token NLL across
+    batches. Returns (perplexity, n_tokens). The caller is responsible for
+    model.eval() and for any pre-tokenization/filtering of the texts.
     """
-    model.eval()
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-
-    nlls = []
+    nlls: list[float] = []
     n_tokens = 0
-    batch: list[dict] = []
+    batch: list[str] = []
 
     def flush() -> None:
         nonlocal nlls, n_tokens
         if not batch:
             return
-        texts = [_build_chat_prompt(tokenizer, ex["prompt"]) + ex["response"] for ex in batch]
         enc = tokenizer(
-            texts,
+            batch,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -158,14 +162,36 @@ def eval_perplexity(
         n_tokens += active
         batch.clear()
 
-    for ex in test_data:
-        batch.append(ex)
+    for t in texts:
+        batch.append(t)
         if len(batch) >= batch_size:
             flush()
     flush()
 
     avg_nll = sum(nlls) / max(n_tokens, 1)
-    return {"perplexity": float(torch.tensor(avg_nll).exp().item()), "n_tokens": int(n_tokens)}
+    return float(torch.tensor(avg_nll).exp().item()), int(n_tokens)
+
+
+def eval_perplexity(
+    model,
+    tokenizer,
+    test_data: list[dict],
+    batch_size: int = 16,
+    max_length: int = 1024,
+) -> dict[str, float]:
+    """Standard sliding-window-free perplexity over the no_robots test split.
+
+    Each example is the full prompt+response conversation tokenized once.
+    We use the model's built-in loss with label = input_ids, which is the
+    conventional causal-LM PPL formulation. Delegates the batched math to
+    _compute_ppl_from_texts so wikitext can reuse the same logic.
+    """
+    model.eval()
+    texts = [_build_chat_prompt(tokenizer, ex["prompt"]) + ex["response"] for ex in test_data]
+    ppl, n_tokens = _compute_ppl_from_texts(
+        model, tokenizer, texts, batch_size=batch_size, max_length=max_length
+    )
+    return {"perplexity": ppl, "n_tokens": n_tokens}
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +218,7 @@ def eval_verbatim_memorization(
     max_new_tokens: int = 128,
     seed: int = 42,
     batch_size: int = 4,
+    generations_sink: list[str] | None = None,
 ) -> dict[str, float]:
     """Sample n training prompts, generate, and measure longest common
     substring with the gold response. We report mean and std across n.
@@ -200,6 +227,12 @@ def eval_verbatim_memorization(
     is the conservative default for max_new_tokens=128; the CLI default
     is 8 (overrideable via --gen-batch-size) and the user can drop it
     back to 4 if the 3B model OOMs at batch=8 * 128 new tokens.
+
+    If `generations_sink` is provided, each decoded continuation is
+    appended to it in order. This is how the diversity metric reuses
+    these generations without re-running inference. When None, the
+    generations are discarded (the default; behavior is unchanged from
+    the version that did not support diversity).
     """
     model.eval()
     rng = random.Random(seed)
@@ -210,6 +243,8 @@ def eval_verbatim_memorization(
         batch_ex = sample[start:start + batch_size]
         prompts = [ex["prompt"] for ex in batch_ex]
         gens = _generate_batch(model, tokenizer, prompts, max_new_tokens=max_new_tokens)
+        if generations_sink is not None:
+            generations_sink.extend(gens)
         for ex, gen in zip(batch_ex, gens):
             lcs = _longest_common_substring(gen, ex["response"])
             lengths.append(lcs)
@@ -466,6 +501,224 @@ def eval_format_robustness(
 
 
 # ---------------------------------------------------------------------------
+# 5. Wikitext-103 cross-domain perplexity
+# ---------------------------------------------------------------------------
+
+def _wiki_ppl_eval(
+    model,
+    tokenizer,
+    batch_size: int = 16,
+    max_examples: int = 0,
+    max_length: int = 1024,
+    cache_dir: str | None = None,
+) -> dict[str, Any]:
+    """Cross-domain perplexity on wikitext-103-raw-v1 test split.
+
+    Filters out empty/short lines (len < 50 chars), then runs the same
+    batched PPL computation as eval_perplexity. max_examples=0 means
+    use the full filtered test split. Cross-domain PPL catches the case
+    where a model overfits to the in-domain no_robots distribution and
+    loses general language modeling quality.
+    """
+    model.eval()
+    ds = load_dataset(
+        "wikitext", "wikitext-103-raw-v1", split="test", cache_dir=cache_dir
+    )
+    texts = [t for t in ds["text"] if len(t.strip()) >= 50]
+    if max_examples > 0:
+        texts = texts[:max_examples]
+    if not texts:
+        return {"perplexity": float("nan"), "n_tokens": 0, "n_filtered_docs": 0}
+    print(f"[eval] wiki_ppl: {len(texts)} wikitext-103 docs after length filter")
+    ppl, n_tokens = _compute_ppl_from_texts(
+        model, tokenizer, texts, batch_size=batch_size, max_length=max_length
+    )
+    return {
+        "perplexity": ppl,
+        "n_tokens": n_tokens,
+        "n_filtered_docs": len(texts),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6. HellaSwag 4-way multiple choice
+# ---------------------------------------------------------------------------
+
+def _score_ending_logprob(
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    ctx_len: int,
+    total_len: int,
+) -> float:
+    """Sum the log-prob of the ending tokens under the model.
+
+    The full text (ctx + ending) is in input_ids. We use the logits at
+    positions [ctx_len-1, total_len-1) to predict the target tokens at
+    positions [ctx_len, total_len). Sum of per-token log-probs is the
+    standard HellaSwag "log-likelihood" score the user requested.
+    """
+    out = model(input_ids=input_ids, attention_mask=attention_mask)
+    log_probs = torch.log_softmax(out.logits[0].float(), dim=-1)
+    # Edge case: ctx_len == total_len means the ending is empty; assign
+    # the worst possible score so this option is never picked.
+    if ctx_len >= total_len:
+        return float("-inf")
+    pred = log_probs[ctx_len - 1 : total_len - 1, :]
+    targets = input_ids[0, ctx_len:total_len]
+    token_log_probs = pred.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    return float(token_log_probs.sum().item())
+
+
+def _hellaswag_eval(
+    model,
+    tokenizer,
+    n: int = 1000,
+    batch_size: int = 8,
+    cache_dir: str | None = None,
+) -> dict[str, Any]:
+    """4-way multiple choice on Rowan/hellaswag (validation split).
+
+    Standard HellaSwag eval: for each example, score each of the 4
+    (ctx + ending) continuations by sum log-prob of the ending tokens,
+    pick the option with the highest score, and compare to the gold
+    label. No chat template -- the dataset is not a chat. Accuracy and
+    the standard-error-of-the-mean (sqrt(p(1-p)/n)) are returned.
+    """
+    model.eval()
+    try:
+        ds = load_dataset("Rowan/hellaswag", split="validation", cache_dir=cache_dir)
+    except Exception as e:
+        return {"error": f"failed to load HellaSwag: {e}", "accuracy": 0.0, "se": 0.0, "n": 0}
+
+    n = min(n, len(ds))
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    correct = 0
+
+    for batch_start in range(0, n, batch_size):
+        batch_exs = [ds[i] for i in range(batch_start, min(batch_start + batch_size, n))]
+        # Tokenize all 4*batch_size (ctx + ending) texts; left-pad to a
+        # shared length so the single forward pass is valid.
+        all_ids: list[list[int]] = []
+        ctx_lens: list[int] = []
+        gold_labels: list[int] = []
+        for ex in batch_exs:
+            ctx_text = ex["ctx"]
+            ctx_ids = tokenizer(ctx_text, add_special_tokens=True)["input_ids"]
+            try:
+                gold_labels.append(int(ex["label"]))
+            except (TypeError, ValueError):
+                gold_labels.append(-1)
+            for ending in ex["endings"]:
+                full_text = ctx_text + " " + ending
+                full_ids = tokenizer(full_text, add_special_tokens=True)["input_ids"]
+                all_ids.append(full_ids)
+                ctx_lens.append(len(ctx_ids))
+
+        max_len = max(len(ids) for ids in all_ids)
+        padded_ids: list[list[int]] = []
+        padded_mask: list[list[int]] = []
+        for ids in all_ids:
+            n_pad = max_len - len(ids)
+            padded_ids.append([pad_id] * n_pad + ids)
+            padded_mask.append([0] * n_pad + [1] * len(ids))
+        input_ids = torch.tensor(padded_ids, dtype=torch.long).to(model.device)
+        attention_mask = torch.tensor(padded_mask, dtype=torch.long).to(model.device)
+
+        with torch.inference_mode():
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+
+        # Score each (example, option) pair, then argmax over the 4 options.
+        for j, ex in enumerate(batch_exs):
+            scores: list[float] = []
+            for k in range(4):
+                opt_idx = j * 4 + k
+                ctx_len = ctx_lens[opt_idx]
+                total_len = len(all_ids[opt_idx])
+                if ctx_len >= total_len:
+                    scores.append(float("-inf"))
+                    continue
+                pred = log_probs[opt_idx, ctx_len - 1 : total_len - 1, :]
+                targets = input_ids[opt_idx, ctx_len:total_len]
+                token_log_probs = pred.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+                scores.append(float(token_log_probs.sum().item()))
+            pred_idx = max(range(4), key=lambda i: scores[i])
+            if pred_idx == gold_labels[j]:
+                correct += 1
+
+    accuracy = correct / max(n, 1)
+    # Standard error of the mean for a Bernoulli: sqrt(p(1-p)/n).
+    se = math.sqrt(accuracy * (1.0 - accuracy) / max(n, 1))
+    return {
+        "accuracy": accuracy,
+        "se": se,
+        "n": int(n),
+        "correct": int(correct),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. Diversity (distinct-1, distinct-2, repetition-4)
+# ---------------------------------------------------------------------------
+
+_WORD_SPLIT_RE = re.compile(r"\w+", flags=re.UNICODE)
+
+
+def _tokenize_for_diversity(text: str) -> list[str]:
+    """Simple word-level tokenization for diversity metrics.
+
+    Uses a regex word split (lowercased) rather than the model's BPE
+    tokenizer. Diversity metrics are about surface-level lexical variety
+    and repetition, where BPE fragmentation would distort the numbers:
+    a single common word split into 4 BPE pieces would look like 4
+    distinct unigrams and inflate distinct-1.
+    """
+    return _WORD_SPLIT_RE.findall(text.lower())
+
+
+def _diversity_eval(generations: list[str]) -> dict[str, Any]:
+    """Compute distinct-1, distinct-2, and repetition-4 over a list of texts.
+
+    Concatenates all generations with a single space, tokenizes as
+    whitespace-separated lowercased words, then:
+      * distinct_1 = unique unigrams / total unigrams
+      * distinct_2 = unique bigrams / total bigrams
+      * repetition_4 = fraction of unique 4-grams whose count > 1
+                       (i.e. how much of the 4-gram vocabulary is repeated
+                       at least once -- a low value means high diversity)
+    """
+    if not generations:
+        return {"distinct_1": 0.0, "distinct_2": 0.0, "repetition_4": 0.0, "n": 0}
+    tokens: list[str] = []
+    for g in generations:
+        tokens.extend(_tokenize_for_diversity(g))
+    if not tokens:
+        return {"distinct_1": 0.0, "distinct_2": 0.0, "repetition_4": 0.0, "n": len(generations)}
+
+    unigrams = tokens
+    bigrams = list(zip(tokens, tokens[1:]))
+    fourgrams = list(zip(tokens, tokens[1:], tokens[2:], tokens[3:]))
+
+    distinct_1 = len(set(unigrams)) / max(len(unigrams), 1)
+    distinct_2 = len(set(bigrams)) / max(len(bigrams), 1)
+
+    if fourgrams:
+        counts = collections.Counter(fourgrams)
+        repeated = sum(1 for c in counts.values() if c > 1)
+        repetition_4 = repeated / len(counts)
+    else:
+        repetition_4 = 0.0
+
+    return {
+        "distinct_1": float(distinct_1),
+        "distinct_2": float(distinct_2),
+        "repetition_4": float(repetition_4),
+        "n": int(len(generations)),
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -485,13 +738,15 @@ def main() -> None:
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from dit_data import load_no_robots
+    from code.dit_data import load_no_robots
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--adapter", required=True, help="Path to LoRA adapter dir")
     parser.add_argument("--base", required=True, help="Base model id")
     parser.add_argument("--model", default=None, help="Override --base (mirrors train.py --model)")
-    parser.add_argument("--out", required=True, help="Path to write JSON results")
+    # --out is the canonical name; --output is accepted as a synonym so
+    # the smoke-test command (which uses --output) works as written.
+    parser.add_argument("--out", "--output", dest="out", required=True, help="Path to write JSON results")
     parser.add_argument("--n-mem", type=int, default=100)
     parser.add_argument("--n-perturb", type=int, default=100)
     parser.add_argument("--n-arc", type=int, default=1172)
@@ -502,6 +757,21 @@ def main() -> None:
     parser.add_argument("--gen-batch-size", type=int, default=8, help="Batch size for ARC/memorization generation")
     parser.add_argument("--ppl-batch-size", type=int, default=16, help="Batch size for perplexity")
     parser.add_argument("--format-batch-size", type=int, default=8, help="Number of questions batched at once in format_robustness (each contributes 5 perturbations)")
+    # New metric knobs (metrics 5-7)
+    parser.add_argument("--wiki-ppl-n", type=int, default=0,
+                        help="Limit wikitext PPL to first N examples. 0 = use all of test split.")
+    parser.add_argument("--hellaswag-n", type=int, default=1000,
+                        help="Limit HellaSwag eval to first N examples. 0 = use all 10042.")
+    # Skip flags for each of the 7 metrics. The original 4 (ppl, lcs,
+    # arc, format) were not present before but are added so smoke tests
+    # can skip the slow existing metrics while exercising the new ones.
+    parser.add_argument("--skip-ppl", action="store_true", help="Skip no_robots perplexity")
+    parser.add_argument("--skip-lcs", action="store_true", help="Skip verbatim memorization (also skips diversity, which depends on its generations)")
+    parser.add_argument("--skip-arc", action="store_true", help="Skip ARC-Challenge")
+    parser.add_argument("--skip-format", action="store_true", help="Skip format robustness")
+    parser.add_argument("--skip-wiki-ppl", action="store_true", help="Skip wikitext-103 PPL")
+    parser.add_argument("--skip-hellaswag", action="store_true", help="Skip HellaSwag")
+    parser.add_argument("--skip-diversity", action="store_true", help="Skip distinct-n + repetition-4 (does NOT skip the LCS generations; only the post-processing)")
     args = parser.parse_args()
 
     transformers_set_seed = __import__("transformers").set_seed
@@ -559,58 +829,116 @@ def main() -> None:
     train_data, test_data = load_no_robots(cache_dir=args.cache_dir)
 
     if "perplexity" not in results:
-        print("[eval] Perplexity")
-        results["perplexity"] = eval_perplexity(
-            model, tokenizer, test_data, batch_size=args.ppl_batch_size
-        )
-        _save_results()
+        if args.skip_ppl:
+            print("[eval] Perplexity: skipped (--skip-ppl)")
+        else:
+            print("[eval] Perplexity")
+            results["perplexity"] = eval_perplexity(
+                model, tokenizer, test_data, batch_size=args.ppl_batch_size
+            )
+            _save_results()
     else:
         print("[eval] Perplexity: cached, skipping")
 
     if "memorization" not in results:
-        print("[eval] Verbatim memorization")
-        results["memorization"] = eval_verbatim_memorization(
-            model,
-            tokenizer,
-            train_data,
-            n=args.n_mem,
-            max_new_tokens=args.max_new,
-            seed=args.seed,
-            batch_size=args.gen_batch_size,
-        )
-        _save_results()
+        if args.skip_lcs:
+            print("[eval] Verbatim memorization: skipped (--skip-lcs)")
+        else:
+            print("[eval] Verbatim memorization")
+            # Reuse these generations for the diversity metric so we
+            # don't have to re-run inference. Only build the sink when
+            # the diversity metric is actually requested.
+            generations_sink: list[str] = [] if not args.skip_diversity else []
+            results["memorization"] = eval_verbatim_memorization(
+                model,
+                tokenizer,
+                train_data,
+                n=args.n_mem,
+                max_new_tokens=args.max_new,
+                seed=args.seed,
+                batch_size=args.gen_batch_size,
+                generations_sink=generations_sink,
+            )
+            _save_results()
+            if not args.skip_diversity and generations_sink:
+                print("[eval] Diversity (reuses LCS generations)")
+                results["diversity"] = _diversity_eval(generations_sink)
+                _save_results()
     else:
         print("[eval] Memorization: cached, skipping")
 
     if "arc" not in results:
-        print("[eval] ARC-Challenge")
-        results["arc"] = eval_arc_challenge(
-            model,
-            tokenizer,
-            n=args.n_arc,
-            max_new_tokens=args.max_new_arc,
-            cache_dir=args.cache_dir,
-            batch_size=args.gen_batch_size,
-        )
-        _save_results()
+        if args.skip_arc:
+            print("[eval] ARC-Challenge: skipped (--skip-arc)")
+        else:
+            print("[eval] ARC-Challenge")
+            results["arc"] = eval_arc_challenge(
+                model,
+                tokenizer,
+                n=args.n_arc,
+                max_new_tokens=args.max_new_arc,
+                cache_dir=args.cache_dir,
+                batch_size=args.gen_batch_size,
+            )
+            _save_results()
     else:
         print("[eval] ARC: cached, skipping")
 
     if "format_robustness" not in results:
-        print("[eval] Format robustness")
-        results["format_robustness"] = eval_format_robustness(
-            model,
-            tokenizer,
-            n=args.n_perturb,
-            n_perturbations=5,
-            max_new_tokens=64,
-            seed=args.seed,
-            cache_dir=args.cache_dir,
-            batch_size_questions=args.format_batch_size,
-        )
-        _save_results()
+        if args.skip_format:
+            print("[eval] Format robustness: skipped (--skip-format)")
+        else:
+            print("[eval] Format robustness")
+            results["format_robustness"] = eval_format_robustness(
+                model,
+                tokenizer,
+                n=args.n_perturb,
+                n_perturbations=5,
+                max_new_tokens=64,
+                seed=args.seed,
+                cache_dir=args.cache_dir,
+                batch_size_questions=args.format_batch_size,
+            )
+            _save_results()
     else:
         print("[eval] Format robustness: cached, skipping")
+
+    # ---- new metrics 5-7 (not gated by the resumability cache; these
+    # are cheap and idempotent, so re-running them is fine and skipping
+    # them via a flag is the user's escape hatch) ----------------------
+
+    if "wiki_ppl" not in results:
+        if args.skip_wiki_ppl:
+            print("[eval] Wikitext-103 PPL: skipped (--skip-wiki-ppl)")
+        else:
+            print("[eval] Wikitext-103 PPL")
+            results["wiki_ppl"] = _wiki_ppl_eval(
+                model,
+                tokenizer,
+                batch_size=args.ppl_batch_size,
+                max_examples=args.wiki_ppl_n,
+                max_length=1024,
+                cache_dir=args.cache_dir,
+            )
+            _save_results()
+    else:
+        print("[eval] Wikitext-103 PPL: cached, skipping")
+
+    if "hellaswag" not in results:
+        if args.skip_hellaswag:
+            print("[eval] HellaSwag: skipped (--skip-hellaswag)")
+        else:
+            print("[eval] HellaSwag")
+            results["hellaswag"] = _hellaswag_eval(
+                model,
+                tokenizer,
+                n=args.hellaswag_n,
+                batch_size=args.gen_batch_size,
+                cache_dir=args.cache_dir,
+            )
+            _save_results()
+    else:
+        print("[eval] HellaSwag: cached, skipping")
 
     print(f"[eval] Wrote {args.out}")
     print(json.dumps(results, indent=2))
